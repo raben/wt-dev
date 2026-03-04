@@ -4,7 +4,7 @@ set -euo pipefail
 # dev - Isolated parallel development environments
 # Usage: dev <command> [options]
 
-VERSION="0.2.0"
+VERSION="0.6.0"
 DEV_STATE_DIR="${DEV_STATE_DIR:-$HOME/.dev-worktree}"
 REGISTRY_FILE="$DEV_STATE_DIR/port-registry.json"
 
@@ -91,17 +91,16 @@ registry_release() {
 # ─── dev up ─────────────────────────────────────────────────────
 
 cmd_up() {
-  local hook_mode=false project_dir="" name="" base_branch="main"
+  local project_dir="" name="" base_branch="main"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --hook)        hook_mode=true; shift ;;
       --project-dir) project_dir="$2"; shift 2 ;;
       -h|--help)
         cat <<EOF
 Usage: dev up [OPTIONS] <name> [base-branch]
 
-Create a worktree and start its devcontainer.
+Create a worktree, start its devcontainer, and launch Claude inside.
 
 Arguments:
   name          Worktree / branch name
@@ -109,22 +108,12 @@ Arguments:
 
 Options:
   --project-dir DIR   Project root (default: git root of CWD)
-  --hook              Read from stdin JSON (Claude Code hook mode)
 EOF
         return 0 ;;
       -*) echo "Unknown option: $1" >&2; return 1 ;;
       *)  [ -z "$name" ] && name="$1" || base_branch="$1"; shift ;;
     esac
   done
-
-  if [ "$hook_mode" = true ]; then
-    local input
-    input=$(cat)
-    name=$(echo "$input" | jq -r '.name // empty')
-    local hook_cwd
-    hook_cwd=$(echo "$input" | jq -r '.cwd // empty')
-    [ -z "$project_dir" ] && [ -n "$hook_cwd" ] && project_dir="$hook_cwd"
-  fi
 
   [ -z "$name" ] && { echo "ERROR: Name is required. Usage: dev up <name> [base-branch]" >&2; return 1; }
 
@@ -139,13 +128,11 @@ EOF
   worktree_dir="$(dirname "$project_dir")/${project_name}-${name}"
   local registry_key="${project_name}/${name}"
 
-  log() { echo "$@" >&2; }
-
   # Cleanup on failure
   cleanup() {
     local ec=$?
     if [ $ec -ne 0 ]; then
-      log "ERROR: Failed. Cleaning up..."
+      echo "ERROR: Failed. Cleaning up..."
       [ -d "$worktree_dir/.devcontainer" ] && docker compose -f "$worktree_dir/.devcontainer/docker-compose.yml" down -v 2>/dev/null || true
       [ -d "$worktree_dir" ] && git -C "$project_dir" worktree remove --force "$worktree_dir" 2>/dev/null || true
       git -C "$project_dir" branch -D "$name" 2>/dev/null || true
@@ -154,22 +141,22 @@ EOF
   }
   trap cleanup EXIT
 
-  [ ! -d "$project_dir/.devcontainer" ] && { log "ERROR: No .devcontainer/ in $project_dir"; return 1; }
+  [ ! -d "$project_dir/.devcontainer" ] && { echo "ERROR: No .devcontainer/ in $project_dir"; return 1; }
 
   # Allocate ports
   local env_example="$project_dir/.devcontainer/.env.example"
   local allocated_vars=""
   if [ -f "$env_example" ]; then
-    log "Allocating ports..."
+    echo "Allocating ports..."
     allocated_vars=$(registry_allocate "$registry_key" "$env_example" "$project_dir" "$worktree_dir")
   fi
 
   # Create worktree
-  log "Creating worktree..."
+  echo "Creating worktree..."
   git -C "$project_dir" worktree add "$worktree_dir" -b "$name" "$base_branch"
 
   # Copy and configure .devcontainer
-  log "Setting up devcontainer..."
+  echo "Setting up devcontainer..."
   cp -r "$project_dir/.devcontainer" "$worktree_dir/.devcontainer"
 
   if [ -n "$allocated_vars" ]; then
@@ -194,38 +181,37 @@ EOF
   fi
 
   # Start devcontainer
-  if command -v devcontainer &>/dev/null; then
-    log "Starting devcontainer..."
-    devcontainer up --workspace-folder "$worktree_dir" >&2
-  else
-    log "WARN: devcontainer CLI not found (npm install -g @devcontainers/cli)"
+  if ! command -v devcontainer &>/dev/null; then
+    echo "ERROR: devcontainer CLI not found. Install: npm install -g @devcontainers/cli" >&2
+    return 1
   fi
+
+  echo "Starting devcontainer..."
+  devcontainer up --workspace-folder "$worktree_dir"
 
   # Summary
-  log ""
-  log "=== Worktree ready ==="
-  log "  Path:   $worktree_dir"
-  log "  Branch: $name"
+  echo ""
+  echo "=== Worktree ready ==="
+  echo "  Path:   $worktree_dir"
+  echo "  Branch: $name"
   if [ -n "$allocated_vars" ]; then
-    log "  Ports:"
-    echo "$allocated_vars" | grep '_PORT=' | while IFS='=' read -r k v; do log "    $k: $v"; done
+    echo "  Ports:"
+    echo "$allocated_vars" | grep '_PORT=' | while IFS='=' read -r k v; do echo "    $k: $v"; done
   fi
-  log ""
-  log "  cd $worktree_dir"
-  log "  devcontainer exec --workspace-folder . claude --dangerously-skip-permissions"
+  echo ""
 
-  # stdout = worktree path (for Claude Code hook)
-  echo "$worktree_dir"
+  # Launch Claude inside the container
+  echo "Launching Claude..."
+  devcontainer exec --workspace-folder "$worktree_dir" claude --dangerously-skip-permissions
 }
 
 # ─── dev down ───────────────────────────────────────────────────
 
 cmd_down() {
-  local hook_mode=false project_dir="" name="" worktree_path="" force=false
+  local project_dir="" name="" worktree_path="" force=false
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --hook)        hook_mode=true; shift ;;
       --project-dir) project_dir="$2"; shift 2 ;;
       --path)        worktree_path="$2"; shift 2 ;;
       --force|-f)    force=true; shift ;;
@@ -239,22 +225,12 @@ Options:
   --project-dir DIR   Project root (default: git root of CWD)
   --path PATH         Worktree path (alternative to name)
   --force, -f         Skip uncommitted changes check
-  --hook              Read from stdin JSON (Claude Code hook mode)
 EOF
         return 0 ;;
       -*) echo "Unknown option: $1" >&2; return 1 ;;
       *)  name="$1"; shift ;;
     esac
   done
-
-  if [ "$hook_mode" = true ]; then
-    local input
-    input=$(cat)
-    worktree_path=$(echo "$input" | jq -r '.worktree_path // empty')
-    local hook_cwd
-    hook_cwd=$(echo "$input" | jq -r '.cwd // empty')
-    [ -z "$project_dir" ] && [ -n "$hook_cwd" ] && project_dir="$hook_cwd"
-  fi
 
   [ -z "$project_dir" ] && project_dir=$(git rev-parse --show-toplevel 2>/dev/null || true)
   local project_name=""
@@ -283,7 +259,7 @@ EOF
     if ! git -C "$worktree_path" diff --quiet 2>/dev/null || \
        ! git -C "$worktree_path" diff --cached --quiet 2>/dev/null; then
       echo "WARNING: Uncommitted changes in $worktree_path"
-      if [ -t 0 ] && [ "$hook_mode" = false ]; then
+      if [ -t 0 ]; then
         read -rp "Continue? (y/N) " confirm
         [[ "$confirm" != [yY]* ]] && { echo "Aborted."; return 1; }
       else
