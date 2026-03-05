@@ -843,7 +843,7 @@ EOF
   _validate_exec_cmd "$exec_cmd"
 
   echo "Generating .devcontainer/ with ${ai_cmd%% *} ..."
-  DEV_EXEC_CMD="$exec_cmd" $ai_cmd --prompt "$INIT_PROMPT"
+  DEV_EXEC_CMD="$exec_cmd" $ai_cmd "$INIT_PROMPT"
 }
 
 # ─── Main ─────────────────────────────────────────────────────
