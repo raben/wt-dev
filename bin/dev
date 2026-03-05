@@ -553,6 +553,17 @@ _container_is_running() {
   [ "$running" -gt 0 ]
 }
 
+# Get WT_EXEC_CMD for a registry key (fallback: claude)
+_get_exec_cmd() {
+  local key="$1"
+  local cmd
+  cmd=$(jq -r --arg k "$key" '.allocations[$k].vars.WT_EXEC_CMD // empty' "$REGISTRY_FILE" 2>/dev/null)
+  if [ -z "$cmd" ]; then
+    cmd="claude --dangerously-skip-permissions"
+  fi
+  echo "$cmd"
+}
+
 _watcher() {
   local session="$1" filter="${2:-}"
 
@@ -610,9 +621,12 @@ _watcher() {
 
       _container_is_running "$wt_path" || continue
 
+      local exec_cmd
+      exec_cmd=$(_get_exec_cmd "$key")
+
       # Use env vars to avoid command injection
-      tmux split-window -t "$session" -e "DEV_KEY=$key" -e "DEV_WT_PATH=$wt_path" \
-        'printf "\033]2;${DEV_KEY}\033\\"; devcontainer exec --workspace-folder "${DEV_WT_PATH}" claude --dangerously-skip-permissions; echo "--- Session ended (${DEV_KEY}). Press Enter to close. ---"; read'
+      tmux split-window -t "$session" -e "DEV_KEY=$key" -e "DEV_WT_PATH=$wt_path" -e "DEV_EXEC_CMD=$exec_cmd" \
+        'printf "\033]2;${DEV_KEY}\033\\"; devcontainer exec --workspace-folder "${DEV_WT_PATH}" ${DEV_EXEC_CMD}; echo "--- Session ended (${DEV_KEY}). Press Enter to close. ---"; read'
       tmux select-pane -T "$key"
       tmux select-layout -t "$session" tiled
     done <<< "$keys"
@@ -630,12 +644,15 @@ cmd_open() {
         cat <<EOF
 Usage: dev open [name]
 
-Open Claude sessions in a tmux dashboard.
+Open AI coding sessions in a tmux dashboard.
 
 Without arguments: opens all running environments in split panes
 with live detection of new environments.
 
 With a name: directly connects to a single environment (no tmux).
+
+The command executed is determined by WT_EXEC_CMD in .env.example
+(default: claude --dangerously-skip-permissions).
 
 Requires 'tmux' for dashboard mode.
 EOF
@@ -660,7 +677,11 @@ EOF
 
     _container_is_running "$worktree_dir" || { echo "ERROR: Container not running. Run 'dev up $name' first." >&2; return 1; }
 
-    devcontainer exec --workspace-folder "$worktree_dir" claude --dangerously-skip-permissions
+    local registry_key="${project_name}/${name}"
+    local exec_cmd
+    exec_cmd=$(_get_exec_cmd "$registry_key")
+
+    devcontainer exec --workspace-folder "$worktree_dir" $exec_cmd
     return
   fi
 
@@ -719,7 +740,7 @@ After user confirmation, generate:
 ### Dockerfile
 - Base image: use the appropriate `mcr.microsoft.com/devcontainers/*` image
 - Install: git, jq, curl
-- Install Claude Code: `npm install -g @anthropic-ai/claude-code`
+- If $DEV_EXEC_CMD contains "claude", install Claude Code: `npm install -g @anthropic-ai/claude-code`
 - Install project-specific package manager if needed (pnpm, yarn, etc.)
 - Non-root user (node for Node.js, vscode for others)
 - WORKDIR /workspace
@@ -730,8 +751,8 @@ After user confirmation, generate:
 - `"service"`: "app"
 - `"workspaceFolder"`: "/workspace"
 - `"remoteUser"`: appropriate non-root user
-- `"mounts"`: bind mount `~/.claude` (for auth) and `~/.gitconfig` (readonly)
-- `"containerEnv"`: set `CLAUDE_CONFIG_DIR` to the mounted .claude path
+- `"mounts"`: bind mount `~/.gitconfig` (readonly). If $DEV_EXEC_CMD contains "claude", also mount `~/.claude` (for auth)
+- `"containerEnv"`: if $DEV_EXEC_CMD contains "claude", set `CLAUDE_CONFIG_DIR` to the mounted .claude path
 - `"postCreateCommand"`: appropriate install command (npm ci, pnpm install, pip install, etc.)
 
 ### docker-compose.yml
@@ -746,6 +767,7 @@ After user confirmation, generate:
 - Header comment explaining the format
 - `WT_NAME=<project-name>`
 - `COMPOSE_PROJECT_NAME=<project-name>`
+- `WT_EXEC_CMD=<exec-command>` (the AI CLI command to run in `dev open`; use the value from $DEV_EXEC_CMD if set, otherwise `claude --dangerously-skip-permissions`)
 - One `WT_<SERVICE>_PORT=<default-port>` line per port mapping in docker-compose.yml
 - Variables ending in `_PORT` are auto-allocated by `dev up`; others are passed through
 
@@ -755,16 +777,22 @@ After user confirmation, generate:
 - If `.devcontainer/` already exists, ask before overwriting.'
 
 cmd_init() {
+  local exec_cmd=""
+
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --exec-cmd) exec_cmd="$2"; shift 2 ;;
       -h|--help)
         cat <<EOF
-Usage: dev init
+Usage: dev init [OPTIONS]
 
 Generate .devcontainer/ for the current project using Claude.
 
 Analyzes the project structure and creates devcontainer configuration
-compatible with 'dev up'. Requires 'claude' CLI to be installed.
+compatible with 'dev up'.
+
+Options:
+  --exec-cmd CMD   AI CLI command for 'dev open' (default: claude --dangerously-skip-permissions)
 EOF
         return 0 ;;
       *) echo "Unknown option: $1" >&2; return 1 ;;
@@ -772,12 +800,30 @@ EOF
   done
 
   if ! command -v claude &>/dev/null; then
-    echo "ERROR: claude CLI not found. Install from https://docs.anthropic.com/en/docs/claude-code" >&2
+    echo "Claude CLI not found."
+    echo ""
+    echo "dev init requires Claude CLI to generate .devcontainer/."
+    echo "Install: npm install -g @anthropic-ai/claude-code"
+    echo ""
+    if [ -z "$exec_cmd" ]; then
+      echo "Which AI CLI will 'dev open' use to connect to containers?"
+      echo "  Examples: claude --dangerously-skip-permissions, aider, codex, bash"
+      printf "  WT_EXEC_CMD [bash]: "
+      read -r exec_cmd
+      exec_cmd="${exec_cmd:-bash}"
+    fi
+    echo ""
+    echo "ERROR: claude CLI is required for 'dev init'. Install it and re-run." >&2
     return 1
   fi
 
+  # Claude available — default exec cmd
+  if [ -z "$exec_cmd" ]; then
+    exec_cmd="claude --dangerously-skip-permissions"
+  fi
+
   echo "Starting Claude to analyze project and generate .devcontainer/ ..."
-  claude --prompt "$INIT_PROMPT"
+  DEV_EXEC_CMD="$exec_cmd" claude --prompt "$INIT_PROMPT"
 }
 
 # ─── Main ─────────────────────────────────────────────────────
@@ -791,7 +837,7 @@ Usage: dev <command> [options]
 Commands:
   init               Generate .devcontainer/ for this project
   up [name] [base]   Create (or resume) worktree + devcontainer
-  open [name]        Open Claude sessions (tmux dashboard)
+  open [name]        Open AI coding sessions (tmux dashboard)
   down <name>        Stop devcontainer (worktree kept)
   prune <name>       Remove worktree, containers, branch, ports
   list               Show active worktrees
