@@ -221,6 +221,17 @@ EOF
       devcontainer up --workspace-folder "$worktree_dir"
     fi
 
+    # Ensure registry entry exists (may be missing after upgrade or manual setup)
+    local reg_check
+    reg_check=$(jq -e --arg k "$registry_key" '.allocations[$k]' "$REGISTRY_FILE" 2>/dev/null || true)
+    if [ -z "$reg_check" ] || [ "$reg_check" = "null" ]; then
+      local env_example="$worktree_dir/.devcontainer/.env.example"
+      if [ -f "$env_example" ]; then
+        echo "Registering existing environment..."
+        registry_allocate "$registry_key" "$env_example" "$project_dir" "$worktree_dir" >/dev/null 2>&1 || true
+      fi
+    fi
+
     echo ""
     echo "Ready. Use 'dev open' to connect."
     return
