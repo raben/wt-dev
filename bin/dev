@@ -4,9 +4,7 @@ set -euo pipefail
 # dev - Isolated parallel development environments
 # Usage: dev <command> [options]
 
-VERSION="0.8.0"
-DEV_STATE_DIR="${DEV_STATE_DIR:-$HOME/.dev-worktree}"
-REGISTRY_FILE="$DEV_STATE_DIR/port-registry.json"
+VERSION="0.9.0"
 
 # ─── Utilities ───────────────────────────────────────────────
 
@@ -25,6 +23,14 @@ _validate_name() {
   fi
   if [[ "$name" == *".."* ]]; then
     echo "ERROR: Name must not contain '..'." >&2
+    return 1
+  fi
+}
+
+_validate_exec_cmd() {
+  local cmd="$1"
+  if [[ "$cmd" =~ [\;\|\&\`\$\>\<] ]] || [[ "$cmd" == *'$('* ]] || [[ "$cmd" == *$'\n'* ]]; then
+    echo "ERROR: WT_EXEC_CMD contains unsafe characters: $cmd" >&2
     return 1
   fi
 }
@@ -50,7 +56,6 @@ _select_environment() {
   done <<< "$containers"
 
   if [ "${#keys[@]}" -eq 1 ]; then
-    # Single environment — use it directly
     echo "${keys[0]%% (*}"
     return 0
   fi
@@ -72,69 +77,15 @@ _select_environment() {
   echo "${selected%% (*}"
 }
 
-_validate_exec_cmd() {
-  local cmd="$1"
-  if [[ "$cmd" =~ [\;\|\&\`\$\>\<] ]] || [[ "$cmd" == *'$('* ]] || [[ "$cmd" == *$'\n'* ]]; then
-    echo "ERROR: WT_EXEC_CMD contains unsafe characters: $cmd" >&2
-    return 1
-  fi
-}
+# ─── Port Allocation ─────────────────────────────────────────
 
-_with_lock() {
-  local lockdir="${REGISTRY_FILE}.lock"
-  local max_wait=30 waited=0
-  while ! mkdir "$lockdir" 2>/dev/null; do
-    sleep 0.1
-    waited=$((waited + 1))
-    if [ "$waited" -ge "$((max_wait * 10))" ]; then
-      echo "ERROR: Could not acquire lock after ${max_wait}s" >&2
-      return 1
-    fi
-  done
-  trap 'rmdir "${REGISTRY_FILE}.lock" 2>/dev/null' RETURN
-  "$@"
-}
-
-_atomic_write() {
-  local target="$1"
-  local tmpfile
-  tmpfile=$(mktemp "${target}.XXXXXX")
-  if cat > "$tmpfile" && mv "$tmpfile" "$target"; then
-    return 0
-  else
-    rm -f "$tmpfile"
-    return 1
-  fi
-}
-
-# ─── Port Registry ────────────────────────────────────────────
-
-registry_ensure() {
-  mkdir -p "$DEV_STATE_DIR"
-  [ -f "$REGISTRY_FILE" ] || echo '{"allocations":{}}' > "$REGISTRY_FILE"
-}
-
-port_is_available() {
+_port_is_available() {
   ! lsof -i ":${1}" -sTCP:LISTEN &>/dev/null
 }
 
-_registry_allocate_impl() {
-  local key="$1" env_example="$2" project_path="${3:-}" worktree_path="${4:-}"
-  registry_ensure
-
-  local registry
-  registry=$(cat "$REGISTRY_FILE")
-
-  if echo "$registry" | jq -e --arg k "$key" '.allocations[$k]' &>/dev/null; then
-    echo "ERROR: Ports already allocated for '$key'" >&2
-    return 1
-  fi
-
-  local used_ports
-  used_ports=$(echo "$registry" | jq -r '[.allocations[].ports | to_entries[].value] | .[]' 2>/dev/null || true)
-
-  local ports="{}"
-  local non_port_vars="{}"
+# Read .env.example → allocate available ports → output KEY=VALUE lines
+_allocate_ports() {
+  local env_example="$1"
 
   while IFS='=' read -r var_name base_value || [ -n "$var_name" ]; do
     [[ -z "$var_name" || "$var_name" =~ ^[[:space:]]*# ]] && continue
@@ -147,56 +98,72 @@ _registry_allocate_impl() {
         return 1
       fi
       local port=$((base_value + 1))
-      while true; do
-        local conflict=false
-        if echo "$used_ports" | grep -qFx "$port" 2>/dev/null; then
-          conflict=true
-        elif ! port_is_available "$port"; then
-          conflict=true
-        fi
-        [ "$conflict" = false ] && break
+      while ! _port_is_available "$port"; do
         port=$((port + 1))
         if [ "$port" -gt 65535 ]; then
           echo "ERROR: No available port for $var_name (base: $base_value)" >&2
           return 1
         fi
       done
-      ports=$(echo "$ports" | jq --arg k "$var_name" --argjson v "$port" '.[$k] = $v')
-      used_ports=$(printf '%s\n%d' "$used_ports" "$port")
+      echo "${var_name}=${port}"
     else
-      non_port_vars=$(echo "$non_port_vars" | jq --arg k "$var_name" --arg v "$base_value" '.[$k] = $v')
+      echo "${var_name}=${base_value}"
     fi
   done < "$env_example"
-
-  local now
-  now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-  registry=$(echo "$registry" | jq \
-    --arg key "$key" --argjson ports "$ports" --argjson vars "$non_port_vars" \
-    --arg time "$now" --arg pp "$project_path" --arg wp "$worktree_path" \
-    '.allocations[$key] = {ports: $ports, vars: $vars, project_path: $pp, worktree_path: $wp, created_at: $time}')
-  echo "$registry" | jq '.' | _atomic_write "$REGISTRY_FILE"
-
-  echo "$ports" | jq -r 'to_entries[] | "\(.key)=\(.value)"'
-  echo "$non_port_vars" | jq -r 'to_entries[] | "\(.key)=\(.value)"'
 }
 
-registry_allocate() {
-  _with_lock _registry_allocate_impl "$@"
+# Read ports from worktree .env file
+_get_ports_from_env() {
+  local wt_path="$1"
+  local env_file="$wt_path/.devcontainer/.env"
+  [ -f "$env_file" ] || return 0
+  { grep '_PORT=' "$env_file" || true; } | while IFS='=' read -r k v; do
+    local label
+    label=$(echo "$k" | sed 's/^WT_//; s/_PORT$//')
+    printf '%s=%s ' "$label" "$v"
+  done
 }
 
-_registry_release_impl() {
-  local key="$1"
-  registry_ensure
-  local registry
-  registry=$(cat "$REGISTRY_FILE")
-  if ! echo "$registry" | jq -e --arg k "$key" '.allocations[$k]' &>/dev/null; then
-    return 0
+# Get WT_EXEC_CMD from worktree .env (fallback: claude)
+_get_exec_cmd() {
+  local wt_path="$1"
+  local cmd=""
+  local env_file="$wt_path/.devcontainer/.env"
+  if [ -f "$env_file" ]; then
+    cmd=$(grep '^WT_EXEC_CMD=' "$env_file" 2>/dev/null | head -1 | cut -d= -f2-)
   fi
-  echo "$registry" | jq --arg k "$key" 'del(.allocations[$k])' | _atomic_write "$REGISTRY_FILE"
+  if [ -z "$cmd" ]; then
+    cmd="claude --dangerously-skip-permissions"
+  fi
+  _validate_exec_cmd "$cmd"
+  echo "$cmd"
 }
 
-registry_release() {
-  _with_lock _registry_release_impl "$@"
+_container_is_running() {
+  local key_or_path="$1"
+  local count
+  count=$(docker ps --filter "label=dev-worktree=$key_or_path" --filter "status=running" -q 2>/dev/null | wc -l | tr -d ' ')
+  [ "$count" -gt 0 ] && return 0
+  count=$(docker ps --filter "label=dev-worktree.path=$key_or_path" --filter "status=running" -q 2>/dev/null | wc -l | tr -d ' ')
+  [ "$count" -gt 0 ]
+}
+
+# Resolve registry key: prepend project name if bare name
+_resolve_key() {
+  local key="$1"
+  if [[ "$key" != */* ]]; then
+    local project_dir
+    project_dir=$(git rev-parse --show-toplevel 2>/dev/null || true)
+    [ -n "$project_dir" ] && key="$(basename "$project_dir")/$key"
+  fi
+  echo "$key"
+}
+
+# Get worktree path from docker label
+_get_wt_path() {
+  local key="$1"
+  docker ps -a --filter "label=dev-worktree=$key" \
+    --format '{{.Label "dev-worktree.path"}}' 2>/dev/null | head -1
 }
 
 # ─── dev up ─────────────────────────────────────────────────────
@@ -214,7 +181,7 @@ Usage: dev up [OPTIONS] [name] [base-branch]
 Create (or resume) a worktree and start its devcontainer.
 
 Arguments:
-  name          Worktree / branch name (auto-generated if omitted)
+  name          Worktree / branch name (default: current branch)
   base-branch   Base branch (default: main)
 
 Options:
@@ -241,7 +208,7 @@ EOF
   project_name=$(basename "$project_dir")
   local worktree_dir
   worktree_dir="$(dirname "$project_dir")/${project_name}-${name}"
-  local registry_key="${project_name}/${name}"
+  local dev_key="${project_name}/${name}"
 
   if ! command -v devcontainer &>/dev/null; then
     echo "ERROR: devcontainer CLI not found. Install: npm install -g @devcontainers/cli" >&2
@@ -252,32 +219,12 @@ EOF
   if [ -d "$worktree_dir" ]; then
     echo "Worktree '$name' already exists at $worktree_dir"
 
-    local compose_file="$worktree_dir/.devcontainer/docker-compose.yml"
-    if [ -f "$compose_file" ]; then
-      local running
-      running=$(docker compose -f "$compose_file" ps --status running -q 2>/dev/null | wc -l | tr -d ' ')
-      if [ "$running" -gt 0 ]; then
-        echo "Container already running."
-      else
-        echo "Starting devcontainer..."
-        devcontainer up --workspace-folder "$worktree_dir" \
-          --id-label "dev-worktree=$registry_key" --id-label "dev-worktree.path=$worktree_dir"
-      fi
+    if _container_is_running "$dev_key"; then
+      echo "Container already running."
     else
       echo "Starting devcontainer..."
       devcontainer up --workspace-folder "$worktree_dir" \
-        --id-label "dev-worktree=$registry_key" --id-label "dev-worktree.path=$worktree_dir"
-    fi
-
-    # Ensure registry entry exists (may be missing after upgrade or manual setup)
-    local reg_check
-    reg_check=$(jq -e --arg k "$registry_key" '.allocations[$k]' "$REGISTRY_FILE" 2>/dev/null || true)
-    if [ -z "$reg_check" ] || [ "$reg_check" = "null" ]; then
-      local env_example="$worktree_dir/.devcontainer/.env.example"
-      if [ -f "$env_example" ]; then
-        echo "Registering existing environment..."
-        registry_allocate "$registry_key" "$env_example" "$project_dir" "$worktree_dir" >/dev/null 2>&1 || true
-      fi
+        --id-label "dev-worktree=$dev_key" --id-label "dev-worktree.path=$worktree_dir"
     fi
 
     echo ""
@@ -292,10 +239,11 @@ EOF
     local ec=$?
     if [ $ec -ne 0 ] && [ "$_cleanup_enabled" = true ]; then
       echo "ERROR: Failed. Cleaning up..."
-      [ -d "$worktree_dir/.devcontainer" ] && docker compose -f "$worktree_dir/.devcontainer/docker-compose.yml" down -v 2>/dev/null || true
+      local cids
+      cids=$(docker ps -a --filter "label=dev-worktree=$dev_key" -q 2>/dev/null || true)
+      [ -n "$cids" ] && echo "$cids" | xargs docker rm -f 2>/dev/null || true
       [ -d "$worktree_dir" ] && git -C "$project_dir" worktree remove --force "$worktree_dir" 2>/dev/null || true
       git -C "$project_dir" branch -D "$name" 2>/dev/null || true
-      registry_release "$registry_key" 2>/dev/null || true
     fi
   }
   trap cleanup EXIT
@@ -307,7 +255,7 @@ EOF
   local allocated_vars=""
   if [ -f "$env_example" ]; then
     echo "Allocating ports..."
-    allocated_vars=$(registry_allocate "$registry_key" "$env_example" "$project_dir" "$worktree_dir")
+    allocated_vars=$(_allocate_ports "$env_example")
   fi
 
   # Create worktree
@@ -341,10 +289,10 @@ EOF
     fi
   fi
 
-  # Start devcontainer with dev-worktree label
+  # Start devcontainer
   echo "Starting devcontainer..."
   devcontainer up --workspace-folder "$worktree_dir" \
-    --id-label "dev-worktree=$registry_key" --id-label "dev-worktree.path=$worktree_dir"
+    --id-label "dev-worktree=$dev_key" --id-label "dev-worktree.path=$worktree_dir"
 
   # Disable cleanup — worktree created successfully
   _cleanup_enabled=false
@@ -366,7 +314,7 @@ EOF
 # ─── dev down ───────────────────────────────────────────────────
 
 cmd_down() {
-  local registry_key=""
+  local dev_key=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -374,36 +322,28 @@ cmd_down() {
         cat <<EOF
 Usage: dev down [name]
 
-Stop devcontainer (worktree and ports are kept).
+Stop devcontainer (worktree is kept).
 Name omitted: select from running environments.
 EOF
         return 0 ;;
       -*) echo "Unknown option: $1" >&2; return 1 ;;
-      *)  registry_key="$1"; shift ;;
+      *)  dev_key="$1"; shift ;;
     esac
   done
 
-  # Resolve registry key
-  if [ -z "$registry_key" ]; then
-    registry_key=$(_select_environment) || return 1
+  if [ -z "$dev_key" ]; then
+    dev_key=$(_select_environment) || return 1
   fi
+  dev_key=$(_resolve_key "$dev_key")
 
-  # If bare name given (no /), prepend project name
-  if [[ "$registry_key" != */* ]]; then
-    local project_dir
-    project_dir=$(git rev-parse --show-toplevel 2>/dev/null || true)
-    [ -n "$project_dir" ] && registry_key="$(basename "$project_dir")/$registry_key"
-  fi
+  echo "Stopping '$dev_key'..."
 
-  echo "Stopping '$registry_key'..."
-
-  # Stop containers by label
   local container_ids
-  container_ids=$(docker ps --filter "label=dev-worktree=$registry_key" -q 2>/dev/null || true)
+  container_ids=$(docker ps --filter "label=dev-worktree=$dev_key" -q 2>/dev/null || true)
   if [ -n "$container_ids" ]; then
     echo "$container_ids" | xargs docker stop 2>/dev/null || true
   else
-    echo "No running containers found for '$registry_key'." >&2
+    echo "No running containers found for '$dev_key'." >&2
   fi
 
   echo "Done."
@@ -412,7 +352,7 @@ EOF
 # ─── dev prune ─────────────────────────────────────────────────
 
 cmd_prune() {
-  local registry_key="" force=false
+  local dev_key="" force=false
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -421,37 +361,29 @@ cmd_prune() {
         cat <<EOF
 Usage: dev prune [OPTIONS] [name]
 
-Remove worktree, containers, branch, and release ports.
+Remove worktree, containers, and branch.
 
 Options:
   --force, -f         Skip uncommitted changes check
 EOF
         return 0 ;;
       -*) echo "Unknown option: $1" >&2; return 1 ;;
-      *)  registry_key="$1"; shift ;;
+      *)  dev_key="$1"; shift ;;
     esac
   done
 
-  # Resolve registry key
-  if [ -z "$registry_key" ]; then
-    registry_key=$(_select_environment) || return 1
+  if [ -z "$dev_key" ]; then
+    dev_key=$(_select_environment) || return 1
   fi
-  if [[ "$registry_key" != */* ]]; then
-    local project_dir
-    project_dir=$(git rev-parse --show-toplevel 2>/dev/null || true)
-    [ -n "$project_dir" ] && registry_key="$(basename "$project_dir")/$registry_key"
-  fi
+  dev_key=$(_resolve_key "$dev_key")
 
-  # Get worktree path from docker label
   local worktree_path
-  worktree_path=$(docker ps -a --filter "label=dev-worktree=$registry_key" \
-    --format '{{.Label "dev-worktree.path"}}' 2>/dev/null | head -1)
-
-  local name="${registry_key#*/}"
+  worktree_path=$(_get_wt_path "$dev_key")
+  local name="${dev_key#*/}"
   local project_dir
   project_dir=$(git rev-parse --show-toplevel 2>/dev/null || true)
 
-  echo "Removing '$registry_key'..."
+  echo "Removing '$dev_key'..."
 
   # Check uncommitted changes
   if [ -n "$worktree_path" ] && [ -d "$worktree_path" ] && [ "$force" = false ]; then
@@ -470,10 +402,10 @@ EOF
   # Stop and remove containers
   echo "Stopping containers..."
   local container_ids
-  container_ids=$(docker ps -a --filter "label=dev-worktree=$registry_key" -q 2>/dev/null || true)
+  container_ids=$(docker ps -a --filter "label=dev-worktree=$dev_key" -q 2>/dev/null || true)
   [ -n "$container_ids" ] && echo "$container_ids" | xargs docker rm -f 2>/dev/null || true
 
-  # Also try compose if available
+  # Also try compose for volumes cleanup
   if [ -n "$worktree_path" ]; then
     local compose_file="$worktree_path/.devcontainer/docker-compose.yml"
     [ -f "$compose_file" ] && docker compose -f "$compose_file" down -v 2>/dev/null || true
@@ -499,8 +431,6 @@ EOF
     fi
   fi
 
-  # Release ports
-  registry_release "$registry_key" 2>/dev/null || true
   echo "Done."
 }
 
@@ -517,7 +447,7 @@ cmd_list() {
         cat <<EOF
 Usage: dev list [OPTIONS]
 
-List dev-worktree environments (detected via container labels).
+List dev-worktree environments.
 
 Options:
   --project-dir DIR   Filter by project
@@ -528,7 +458,6 @@ EOF
     esac
   done
 
-  # Query containers with dev-worktree label
   local containers
   containers=$(docker ps -a --filter "label=dev-worktree" \
     --format '{{.Label "dev-worktree"}}\t{{.Label "dev-worktree.path"}}\t{{.State}}\t{{.Names}}' 2>/dev/null || true)
@@ -563,7 +492,6 @@ EOF
   printf "%-25s %-10s %-35s %s\n" "NAME" "STATUS" "PORTS" "PATH"
   printf "%-25s %-10s %-35s %s\n" "----" "------" "-----" "----"
 
-  # Collect unique keys (multiple containers per environment)
   local seen_keys=""
   while IFS=$'\t' read -r key wt_path state cname; do
     [ -z "$key" ] && continue
@@ -571,105 +499,26 @@ EOF
     seen_keys=$(printf '%s\n%s' "$seen_keys" "$key")
 
     local status="stopped"
-    # Check if any container for this key is running
     echo "$containers" | grep "^${key}"$'\t' | grep -q "running" && status="running"
 
-    # Get ports from registry if available
     local ports=""
-    registry_ensure
-    ports=$(jq -r --arg k "$key" \
-      '.allocations[$k].ports // {} | to_entries | map("\(.key | gsub("WT_";"") | gsub("_PORT";""))=\(.value)") | join(", ")' \
-      "$REGISTRY_FILE" 2>/dev/null || true)
+    [ -n "$wt_path" ] && ports=$(_get_ports_from_env "$wt_path")
 
     printf "%-25s %-10s %-35s %s\n" "$key" "$status" "$ports" "$wt_path"
   done <<< "$containers"
 }
 
-# ─── dev ports ─────────────────────────────────────────────────
-
-cmd_ports() {
-  local subcmd="${1:-list}"
-  shift 2>/dev/null || true
-
-  case "$subcmd" in
-    allocate)     registry_allocate "$@" ;;
-    release)      registry_release "$@" && echo "Released." ;;
-    get)
-      local key="${1:?Usage: dev ports get <key>}"
-      registry_ensure
-      jq -r --arg k "$key" '.allocations[$k].ports | to_entries[] | "\(.key)=\(.value)"' "$REGISTRY_FILE"
-      ;;
-    find-by-path)
-      local path="${1:?Usage: dev ports find-by-path <path>}"
-      registry_ensure
-      jq -r --arg p "$path" '.allocations | to_entries[] | select(.value.worktree_path == $p) | .key' "$REGISTRY_FILE"
-      ;;
-    list)
-      registry_ensure
-      local count
-      count=$(jq '.allocations | length' "$REGISTRY_FILE")
-      if [ "$count" -eq 0 ]; then echo "No allocations."; return 0; fi
-      printf "%-30s %-40s %s\n" "KEY" "WORKTREE PATH" "PORTS"
-      printf "%-30s %-40s %s\n" "---" "-------------" "-----"
-      jq -r '.allocations | to_entries[] | [
-        .key, .value.worktree_path,
-        (.value.ports | to_entries | map("\(.key)=\(.value)") | join(", "))
-      ] | @tsv' "$REGISTRY_FILE" | while IFS=$'\t' read -r key wt_path ports; do
-        printf "%-30s %-40s %s\n" "$key" "$wt_path" "$ports"
-      done
-      ;;
-    -h|--help)
-      cat <<EOF
-Usage: dev ports <command> [args]
-
-Commands:
-  list                          List all port allocations
-  get <key>                     Show ports for a worktree
-  allocate <key> <env-example>  Allocate ports
-  release <key>                 Release ports
-  find-by-path <path>           Find key by worktree path
-EOF
-      ;;
-    *) echo "Unknown ports command: $subcmd" >&2; return 1 ;;
-  esac
-}
-
 # ─── dev open ─────────────────────────────────────────────────
-
-_container_is_running() {
-  local key_or_path="$1"
-  # Try by dev-worktree label first
-  local count
-  count=$(docker ps --filter "label=dev-worktree=$key_or_path" --filter "status=running" -q 2>/dev/null | wc -l | tr -d ' ')
-  [ "$count" -gt 0 ] && return 0
-  # Fallback: try by dev-worktree.path label
-  count=$(docker ps --filter "label=dev-worktree.path=$key_or_path" --filter "status=running" -q 2>/dev/null | wc -l | tr -d ' ')
-  [ "$count" -gt 0 ]
-}
-
-# Get WT_EXEC_CMD for a registry key (fallback: claude)
-_get_exec_cmd() {
-  local key="$1"
-  local cmd
-  cmd=$(jq -r --arg k "$key" '.allocations[$k].vars.WT_EXEC_CMD // empty' "$REGISTRY_FILE" 2>/dev/null)
-  if [ -z "$cmd" ]; then
-    cmd="claude --dangerously-skip-permissions"
-  fi
-  _validate_exec_cmd "$cmd"
-  echo "$cmd"
-}
 
 _watcher() {
   trap 'exit 0' SIGTERM SIGINT
   local session="$1" filter="${2:-}"
 
   while true; do
-    # ── Live status display ──
     tput clear 2>/dev/null || clear
     echo "dev-worktree dashboard  (poll: 3s)"
     echo ""
 
-    # Query containers with dev-worktree label
     local containers
     containers=$(docker ps -a --filter "label=dev-worktree" \
       --format '{{.Label "dev-worktree"}}\t{{.Label "dev-worktree.path"}}\t{{.State}}' 2>/dev/null || true)
@@ -690,10 +539,7 @@ _watcher() {
         echo "$containers" | grep "^${key}"$'\t' | grep -q "running" && status="running"
 
         local ports=""
-        registry_ensure
-        ports=$(jq -r --arg k "$key" \
-          '.allocations[$k].ports // {} | to_entries | map("\(.key | gsub("WT_";"") | gsub("_PORT";""))=\(.value)") | join(", ")' \
-          "$REGISTRY_FILE" 2>/dev/null || true)
+        [ -n "$wt_path" ] && ports=$(_get_ports_from_env "$wt_path")
 
         printf "  %-25s %-10s %s\n" "$key" "$status" "$ports"
       done <<< "$containers"
@@ -711,13 +557,11 @@ _watcher() {
       [ "$state" != "running" ] && continue
       [ -n "$filter" ] && [[ "$key" != *"$filter"* ]] && continue
       echo "$existing_titles" | grep -qFx "$key" && continue
-
-      [ -z "$wt_path" ] || [ "$wt_path" = "null" ] && continue
+      [ -z "$wt_path" ] && continue
 
       local exec_cmd
-      exec_cmd=$(_get_exec_cmd "$key")
+      exec_cmd=$(_get_exec_cmd "$wt_path")
 
-      # Use env vars to avoid command injection
       tmux split-window -t "$session" -e "DEV_KEY=$key" -e "DEV_WT_PATH=$wt_path" -e "DEV_EXEC_CMD=$exec_cmd" \
         'printf "\033]2;${DEV_KEY}\033\\"; devcontainer exec --workspace-folder "${DEV_WT_PATH}" ${DEV_EXEC_CMD}; echo "--- Session ended (${DEV_KEY}). Press Enter to close. ---"; read'
       tmux select-pane -T "$key"
@@ -739,12 +583,10 @@ Usage: dev open [name]
 
 Open AI coding sessions in a tmux dashboard.
 
-Without arguments: opens all running environments in split panes
-with live detection of new environments.
+Without arguments: single env → direct connect, multiple → select.
+With a name: directly connects to that environment.
 
-With a name: directly connects to a single environment (no tmux).
-
-The command executed is determined by WT_EXEC_CMD in .env.example
+The command is determined by WT_EXEC_CMD in .devcontainer/.env
 (default: claude --dangerously-skip-permissions).
 
 Requires 'tmux' for dashboard mode.
@@ -757,7 +599,6 @@ EOF
 
   # ── Resolve name if not specified ──
   if [ -z "$name" ]; then
-    # Count running dev-worktree containers
     local running_containers
     running_containers=$(docker ps --filter "label=dev-worktree" --filter "status=running" \
       --format '{{.Label "dev-worktree"}}' 2>/dev/null | sort -u || true)
@@ -765,12 +606,10 @@ EOF
     running_count=$(echo "$running_containers" | grep -c . 2>/dev/null || echo 0)
 
     if [ "$running_count" -eq 1 ]; then
-      # Single environment — connect directly
       local selected_key
       selected_key=$(echo "$running_containers" | head -1)
       name="${selected_key#*/}"
     elif [ "$running_count" -gt 1 ]; then
-      # Multiple — ask: select one or dashboard
       local selected
       selected=$(_select_environment) || return 1
       name="${selected#*/}"
@@ -779,30 +618,18 @@ EOF
 
   # ── Single session mode ──
   if [ -n "$name" ]; then
-    local project_dir
-    project_dir=$(git rev-parse --show-toplevel 2>/dev/null || true)
-    [ -z "$project_dir" ] && { echo "ERROR: Not in a git repo." >&2; return 1; }
+    local dev_key
+    dev_key=$(_resolve_key "$name")
 
-    local project_name
-    project_name=$(basename "$project_dir")
-    local worktree_dir
-    worktree_dir="$(dirname "$project_dir")/${project_name}-${name}"
-
-    local registry_key="${project_name}/${name}"
-
-    _container_is_running "$registry_key" || _container_is_running "$worktree_dir" || \
+    _container_is_running "$dev_key" || \
       { echo "ERROR: Container not running. Run 'dev up $name' first." >&2; return 1; }
 
-    # Resolve worktree_dir from docker label if directory doesn't exist
-    if [ ! -d "$worktree_dir" ]; then
-      local label_path
-      label_path=$(docker ps --filter "label=dev-worktree=$registry_key" --filter "status=running" \
-        --format '{{.Label "dev-worktree.path"}}' 2>/dev/null | head -1)
-      [ -n "$label_path" ] && worktree_dir="$label_path"
-      [ ! -d "$worktree_dir" ] && { echo "ERROR: Worktree '$name' not found." >&2; return 1; }
-    fi
+    local worktree_dir
+    worktree_dir=$(_get_wt_path "$dev_key")
+    [ -z "$worktree_dir" ] && { echo "ERROR: Cannot resolve worktree path for '$dev_key'." >&2; return 1; }
+
     local exec_cmd
-    exec_cmd=$(_get_exec_cmd "$registry_key")
+    exec_cmd=$(_get_exec_cmd "$worktree_dir")
 
     devcontainer exec --workspace-folder "$worktree_dir" $exec_cmd
     return
@@ -818,10 +645,8 @@ EOF
   local dev_cmd
   dev_cmd=$(realpath "$0" 2>/dev/null || echo "$0")
 
-  # Kill stale session
   tmux kill-session -t "$session" 2>/dev/null || true
 
-  # Start tmux with watcher in first pane
   tmux new-session -d -s "$session" -n "dev" \
     -e "DEV_CMD=$dev_cmd" -e "DEV_SESSION=$session" \
     '"${DEV_CMD}" _watcher "${DEV_SESSION}"'
@@ -929,7 +754,6 @@ EOF
     return 1
   fi
 
-  # WT_EXEC_CMD default: match ai_cmd
   if [ -z "$exec_cmd" ]; then
     case "$ai_cmd" in
       claude) exec_cmd="claude --dangerously-skip-permissions" ;;
@@ -953,11 +777,10 @@ Usage: dev <command> [options]
 Commands:
   init               Generate .devcontainer/ for this project
   up [name] [base]   Create (or resume) worktree + devcontainer
-  open [name]        Open AI coding sessions (tmux dashboard)
-  down <name>        Stop devcontainer (worktree kept)
-  prune <name>       Remove worktree, containers, branch, ports
-  list               Show active worktrees
-  ports              Manage port allocations
+  open [name]        Open AI coding sessions
+  down [name]        Stop devcontainer (worktree kept)
+  prune [name]       Remove worktree, containers, branch
+  list               Show environments
 
 Run 'dev <command> --help' for details.
 EOF
@@ -970,7 +793,6 @@ case "${1:-}" in
   down)     shift; cmd_down "$@" ;;
   prune)    shift; cmd_prune "$@" ;;
   list|ls)  shift; cmd_list "$@" ;;
-  ports)    shift; cmd_ports "$@" ;;
   _watcher) shift; _watcher "$@" ;;
   -v|--version) echo "dev $VERSION" ;;
   -h|--help|"") usage ;;

@@ -105,10 +105,9 @@ dev prune feature-auth
 | `dev init` | `.devcontainer/` を対話的に生成 |
 | `dev up [name] [base]` | worktree 作成 → コンテナ起動 |
 | `dev open [name]` | AI セッションを開く（tmux ダッシュボード） |
-| `dev down <name>` | コンテナ停止（worktree は保持） |
-| `dev prune <name>` | コンテナ・worktree・ブランチ・ポートを完全削除 |
+| `dev down [name]` | コンテナ停止（worktree は保持） |
+| `dev prune [name]` | コンテナ・worktree・ブランチを完全削除 |
 | `dev list` | 稼働中の worktree 一覧 |
-| `dev ports` | ポート割り当て管理 |
 
 各コマンドの詳細は `dev <command> --help` で確認できる。
 
@@ -126,10 +125,10 @@ WT_WEB_PORT=3001
 WT_DB_PORT=5432
 ```
 
-- `_PORT` で終わる変数は `dev up` 時に空きポートが自動割り当てされる
+- `_PORT` で終わる変数は `dev up` 時に `lsof` で空きポートを検出して自動割り当て
 - `WT_EXEC_CMD` は `dev open` で実行されるコマンド
 - それ以外の変数はそのまま渡される
-- 割り当て状態は `~/.dev-worktree/port-registry.json` でグローバル管理
+- 割り当て結果は worktree の `.devcontainer/.env` に保存される
 
 ## ディレクトリ構造
 
