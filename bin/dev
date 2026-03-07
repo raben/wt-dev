@@ -6,6 +6,12 @@ set -euo pipefail
 
 VERSION="0.9.0"
 
+# ─── Debug mode ─────────────────────────────────────────────
+# Set DEV_DEBUG=1 to enable trace output for troubleshooting.
+if [ "${DEV_DEBUG:-}" = "1" ]; then
+  set -x
+fi
+
 # ─── Utilities ───────────────────────────────────────────────
 
 _trim() {
@@ -27,10 +33,12 @@ _validate_name() {
   fi
 }
 
+# Allowlist-based validation: only safe chars for shell word-splitting.
 _validate_exec_cmd() {
   local cmd="$1"
-  if [[ "$cmd" =~ [\;\|\&\`\$\>\<] ]] || [[ "$cmd" == *'$('* ]] || [[ "$cmd" == *$'\n'* ]]; then
+  if [[ ! "$cmd" =~ ^[a-zA-Z0-9\ _./:=@,+-]+$ ]]; then
     echo "ERROR: WT_EXEC_CMD contains unsafe characters: $cmd" >&2
+    echo "Allowed: alphanumeric, spaces, dots, hyphens, underscores, slashes, colons, equals, @, commas" >&2
     return 1
   fi
 }
@@ -41,22 +49,24 @@ _select_environment() {
     --format '{{.Label "dev-worktree"}}\t{{.State}}' 2>/dev/null || true)
 
   if [ -z "$containers" ]; then
-    echo "ERROR: No dev-worktree environments found." >&2
+    echo "ERROR: No dev-worktree environments found. Run 'dev up <name>' first." >&2
     return 1
   fi
 
   # Deduplicate keys
+  local -A seen_map=()
   local keys=()
-  local seen=""
   while IFS=$'\t' read -r key state; do
     [ -z "$key" ] && continue
-    echo "$seen" | grep -qFx "$key" && continue
-    seen=$(printf '%s\n%s' "$seen" "$key")
+    [[ -n "${seen_map[$key]+x}" ]] && continue
+    seen_map[$key]=1
     keys+=("$key ($state)")
   done <<< "$containers"
 
   if [ "${#keys[@]}" -eq 1 ]; then
-    echo "${keys[0]%% (*}"
+    local result="${keys[0]%% (*}"
+    _validate_name "$result" || return 1
+    echo "$result"
     return 0
   fi
 
@@ -74,18 +84,31 @@ _select_environment() {
     return 1
   fi
   local selected="${keys[$((choice - 1))]}"
-  echo "${selected%% (*}"
+  local result="${selected%% (*}"
+  _validate_name "$result" || return 1
+  echo "$result"
 }
 
 # ─── Port Allocation ─────────────────────────────────────────
 
+# Check port availability with lsof (macOS) or ss (Linux) fallback.
 _port_is_available() {
-  ! lsof -i ":${1}" -sTCP:LISTEN &>/dev/null
+  if command -v lsof &>/dev/null; then
+    ! lsof -i ":${1}" -sTCP:LISTEN &>/dev/null
+  elif command -v ss &>/dev/null; then
+    ! ss -tlnH "sport = :${1}" 2>/dev/null | grep -q .
+  else
+    echo "WARNING: Cannot check port availability (no lsof or ss)" >&2
+    return 0
+  fi
 }
 
-# Read .env.example → allocate available ports → output KEY=VALUE lines
+# Read .env.example → allocate available ports → output KEY=VALUE lines.
+# Port availability is checked via lsof/ss. Note: TOCTOU race exists between
+# check and actual bind by devcontainer; mitigated by the mkdir lock in cmd_up.
 _allocate_ports() {
   local env_example="$1"
+  local var_name="" base_value="" port=""
 
   while IFS='=' read -r var_name base_value || [ -n "$var_name" ]; do
     [[ -z "$var_name" || "$var_name" =~ ^[[:space:]]*# ]] && continue
@@ -97,7 +120,11 @@ _allocate_ports() {
         echo "ERROR: Invalid port value for $var_name: $base_value" >&2
         return 1
       fi
-      local port=$((base_value + 1))
+      if [ "$base_value" -lt 1024 ] || [ "$base_value" -gt 65535 ]; then
+        echo "ERROR: Port $base_value out of valid range (1024-65535) for $var_name" >&2
+        return 1
+      fi
+      port=$base_value
       while ! _port_is_available "$port"; do
         port=$((port + 1))
         if [ "$port" -gt 65535 ]; then
@@ -117,10 +144,9 @@ _get_ports_from_env() {
   local wt_path="$1"
   local env_file="$wt_path/.devcontainer/.env"
   [ -f "$env_file" ] || return 0
+  local k="" v=""
   { grep '_PORT=' "$env_file" || true; } | while IFS='=' read -r k v; do
-    local label
-    label=$(echo "$k" | sed 's/^WT_//; s/_PORT$//')
-    printf '%s=%s ' "$label" "$v"
+    printf '%s=%s ' "$(echo "$k" | sed 's/^WT_//; s/_PORT$//')" "$v"
   done
 }
 
@@ -139,22 +165,26 @@ _get_exec_cmd() {
   echo "$cmd"
 }
 
+# Check if a container with the given dev-worktree label key is running.
 _container_is_running() {
-  local key_or_path="$1"
+  local key="$1"
   local count
-  count=$(docker ps --filter "label=dev-worktree=$key_or_path" --filter "status=running" -q 2>/dev/null | wc -l | tr -d ' ')
-  [ "$count" -gt 0 ] && return 0
-  count=$(docker ps --filter "label=dev-worktree.path=$key_or_path" --filter "status=running" -q 2>/dev/null | wc -l | tr -d ' ')
+  count=$(docker ps --filter "label=dev-worktree=$key" --filter "status=running" -q 2>/dev/null | wc -l | tr -d ' ')
   [ "$count" -gt 0 ]
 }
 
-# Resolve registry key: prepend project name if bare name
+# Resolve key: prepend project name if bare name given.
+# Returns error if not in a git repo and key has no '/'.
 _resolve_key() {
   local key="$1"
   if [[ "$key" != */* ]]; then
     local project_dir
     project_dir=$(git rev-parse --show-toplevel 2>/dev/null || true)
-    [ -n "$project_dir" ] && key="$(basename "$project_dir")/$key"
+    if [ -z "$project_dir" ]; then
+      echo "ERROR: Not in a git repository. Specify full key (project/name) or cd into the project." >&2
+      return 1
+    fi
+    key="$(basename "$project_dir")/$key"
   fi
   echo "$key"
 }
@@ -189,13 +219,13 @@ Options:
 EOF
         return 0 ;;
       -*) echo "Unknown option: $1" >&2; return 1 ;;
-      *)  [ -z "$name" ] && name="$1" || base_branch="$1"; shift ;;
+      *)  if [ -z "$name" ]; then name="$1"; else base_branch="$1"; fi; shift ;;
     esac
   done
 
   if [ -z "$name" ]; then
     name=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || true)
-    [ -z "$name" ] || [ "$name" = "HEAD" ] && name="wt-$(head -c 4 /dev/urandom | xxd -p)"
+    [ -z "$name" ] || [ "$name" = "HEAD" ] && name="wt-$(od -An -tx1 -N4 /dev/urandom | tr -d ' \n')"
   fi
   _validate_name "$name"
 
@@ -210,6 +240,16 @@ EOF
   worktree_dir="$(dirname "$project_dir")/${project_name}-${name}"
   local dev_key="${project_name}/${name}"
 
+  # Validate worktree_dir is within expected parent (defense against path traversal)
+  local expected_parent
+  expected_parent=$(cd "$(dirname "$project_dir")" && pwd)
+  local resolved_wt_dir
+  resolved_wt_dir=$(cd "$(dirname "$project_dir")" && mkdir -p "$(dirname "${project_name}-${name}")" 2>/dev/null; cd "$(dirname "$project_dir")" && echo "$(pwd)/${project_name}-${name}")
+  case "$resolved_wt_dir" in
+    "$expected_parent"/*) ;; # ok
+    *) echo "ERROR: Worktree path escapes expected parent directory." >&2; return 1 ;;
+  esac
+
   if ! command -v devcontainer &>/dev/null; then
     echo "ERROR: devcontainer CLI not found. Install: npm install -g @devcontainers/cli" >&2
     return 1
@@ -219,12 +259,21 @@ EOF
   if [ -d "$worktree_dir" ]; then
     echo "Worktree '$name' already exists at $worktree_dir"
 
+    # Remove exited containers before resuming (prevents stale state)
+    local exited_ids
+    exited_ids=$(docker ps -a --filter "label=dev-worktree=$dev_key" --filter "status=exited" -q 2>/dev/null || true)
+    if [ -n "$exited_ids" ]; then
+      echo "$exited_ids" | while read -r cid; do docker rm -f "$cid" 2>/dev/null || true; done
+    fi
+
     if _container_is_running "$dev_key"; then
       echo "Container already running."
     else
       echo "Starting devcontainer..."
       devcontainer up --workspace-folder "$worktree_dir" \
-        --id-label "dev-worktree=$dev_key" --id-label "dev-worktree.path=$worktree_dir"
+        --id-label "dev-worktree=$dev_key" \
+        --id-label "dev-worktree.path=$worktree_dir" \
+        --id-label "dev-worktree.version=$VERSION"
     fi
 
     echo ""
@@ -233,17 +282,36 @@ EOF
   fi
 
   # ── New worktree: create ──
+  local lockdir="/tmp/dev-worktree-${dev_key//\//_}.lock"
+  if ! mkdir "$lockdir" 2>/dev/null; then
+    echo "ERROR: Another 'dev up' for '$dev_key' is already running." >&2
+    return 1
+  fi
+
   local _cleanup_enabled=true
+  local _branch_created=false
 
   cleanup() {
     local ec=$?
+    rmdir "$lockdir" 2>/dev/null || true
     if [ $ec -ne 0 ] && [ "$_cleanup_enabled" = true ]; then
       echo "ERROR: Failed. Cleaning up..."
-      local cids
-      cids=$(docker ps -a --filter "label=dev-worktree=$dev_key" -q 2>/dev/null || true)
-      [ -n "$cids" ] && echo "$cids" | xargs docker rm -f 2>/dev/null || true
-      [ -d "$worktree_dir" ] && git -C "$project_dir" worktree remove --force "$worktree_dir" 2>/dev/null || true
-      git -C "$project_dir" branch -D "$name" 2>/dev/null || true
+      local cid
+      for cid in $(docker ps -a --filter "label=dev-worktree=$dev_key" -q 2>/dev/null || true); do
+        docker rm -f "$cid" 2>/dev/null || true
+      done
+      if [ -d "$worktree_dir" ]; then
+        git -C "$project_dir" worktree remove --force "$worktree_dir" 2>/dev/null || true
+      fi
+      if [ "$_branch_created" = true ]; then
+        git -C "$project_dir" branch -D "$name" 2>/dev/null || true
+      fi
+      # Clean up temp files
+      rm -f "${worktree_dir}/.devcontainer/docker-compose.yml.tmp" 2>/dev/null || true
+      rm -f "${worktree_dir}/.devcontainer/devcontainer.json.tmp" 2>/dev/null || true
+      echo "If cleanup was incomplete, try manually:" >&2
+      echo "  docker rm -f \$(docker ps -a --filter 'label=dev-worktree=$dev_key' -q)" >&2
+      echo "  git worktree remove --force '$worktree_dir'" >&2
     fi
   }
   trap cleanup EXIT
@@ -261,8 +329,11 @@ EOF
   # Create worktree
   echo "Creating worktree..."
   git -C "$project_dir" worktree add "$worktree_dir" -b "$name" -- "$base_branch"
+  _branch_created=true
 
-  # Copy and configure .devcontainer
+  # Copy .devcontainer from project root to worktree.
+  # This overwrites the git-checked-out version with the canonical template,
+  # ensuring port substitution and compose configuration work correctly.
   echo "Setting up devcontainer..."
   cp -r "$project_dir/.devcontainer" "$worktree_dir/.devcontainer"
 
@@ -270,13 +341,18 @@ EOF
     allocated_vars=$(printf '%s\nWT_NAME=%s\nCOMPOSE_PROJECT_NAME=%s' \
       "$allocated_vars" "${project_name}-${name}" "${project_name}-${name}")
 
-    echo "$allocated_vars" > "$worktree_dir/.devcontainer/.env"
+    install -m 600 /dev/null "$worktree_dir/.devcontainer/.env"
+    printf '%s\n' "$allocated_vars" > "$worktree_dir/.devcontainer/.env"
 
     local compose_file="$worktree_dir/.devcontainer/docker-compose.yml"
     if [ -f "$compose_file" ]; then
+      local key="" val="" escaped_val=""
       while IFS='=' read -r key val; do
         [ -z "$key" ] && continue
-        local escaped_val
+        if [[ ! "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+          echo "WARNING: Skipping invalid env key: $key" >&2
+          continue
+        fi
         escaped_val=$(printf '%s\n' "$val" | sed 's/[&/|\\]/\\&/g')
         sed "s|\${${key}:-[^}]*}|${escaped_val}|g" "$compose_file" > "${compose_file}.tmp" && mv "${compose_file}.tmp" "$compose_file"
         sed "s|\${${key}}|${escaped_val}|g" "$compose_file" > "${compose_file}.tmp" && mv "${compose_file}.tmp" "$compose_file"
@@ -292,11 +368,14 @@ EOF
   # Start devcontainer
   echo "Starting devcontainer..."
   devcontainer up --workspace-folder "$worktree_dir" \
-    --id-label "dev-worktree=$dev_key" --id-label "dev-worktree.path=$worktree_dir"
+    --id-label "dev-worktree=$dev_key" \
+    --id-label "dev-worktree.path=$worktree_dir" \
+    --id-label "dev-worktree.version=$VERSION"
 
   # Disable cleanup — worktree created successfully
   _cleanup_enabled=false
   trap - EXIT
+  rmdir "$lockdir" 2>/dev/null || true
 
   # Summary
   echo ""
@@ -341,7 +420,8 @@ EOF
   local container_ids
   container_ids=$(docker ps --filter "label=dev-worktree=$dev_key" -q 2>/dev/null || true)
   if [ -n "$container_ids" ]; then
-    echo "$container_ids" | xargs docker stop 2>/dev/null || true
+    local cid
+    echo "$container_ids" | while read -r cid; do docker stop "$cid" 2>/dev/null || true; done
   else
     echo "No running containers found for '$dev_key'." >&2
   fi
@@ -380,8 +460,22 @@ EOF
   local worktree_path
   worktree_path=$(_get_wt_path "$dev_key")
   local name="${dev_key#*/}"
-  local project_dir
-  project_dir=$(git rev-parse --show-toplevel 2>/dev/null || true)
+
+  # Derive project_dir from worktree_path (more reliable than CWD)
+  local project_dir=""
+  if [ -n "$worktree_path" ] && [ -d "$worktree_path" ]; then
+    project_dir=$(git -C "$worktree_path" rev-parse --show-toplevel 2>/dev/null || true)
+    # worktree's toplevel is itself; get the main repo via commondir
+    local commondir
+    commondir=$(git -C "$worktree_path" rev-parse --git-common-dir 2>/dev/null || true)
+    if [ -n "$commondir" ]; then
+      project_dir=$(cd "$worktree_path" && cd "$commondir" && cd .. && pwd)
+    fi
+  fi
+  # Fallback to CWD-based detection
+  if [ -z "$project_dir" ]; then
+    project_dir=$(git rev-parse --show-toplevel 2>/dev/null || true)
+  fi
 
   echo "Removing '$dev_key'..."
 
@@ -399,28 +493,39 @@ EOF
     fi
   fi
 
-  # Stop and remove containers
+  # Stop and remove containers + volumes
   echo "Stopping containers..."
-  local container_ids
-  container_ids=$(docker ps -a --filter "label=dev-worktree=$dev_key" -q 2>/dev/null || true)
-  [ -n "$container_ids" ] && echo "$container_ids" | xargs docker rm -f 2>/dev/null || true
 
-  # Also try compose for volumes cleanup
+  # Try compose first for proper volumes cleanup
   if [ -n "$worktree_path" ]; then
     local compose_file="$worktree_path/.devcontainer/docker-compose.yml"
-    [ -f "$compose_file" ] && docker compose -f "$compose_file" down -v 2>/dev/null || true
+    if [ -f "$compose_file" ]; then
+      docker compose -f "$compose_file" down -v 2>/dev/null || true
+    fi
+  fi
+
+  # Fallback: force-remove any remaining containers by label
+  local container_ids
+  container_ids=$(docker ps -a --filter "label=dev-worktree=$dev_key" -q 2>/dev/null || true)
+  if [ -n "$container_ids" ]; then
+    local cid
+    echo "$container_ids" | while read -r cid; do docker rm -f "$cid" 2>/dev/null || true; done
   fi
 
   # Remove worktree
   if [ -n "$worktree_path" ] && [ -d "$worktree_path" ]; then
     echo "Removing worktree..."
-    if [ "$force" = true ]; then
-      git -C "$project_dir" worktree remove --force "$worktree_path" 2>/dev/null || true
-    else
-      git -C "$project_dir" worktree remove "$worktree_path" 2>/dev/null || true
+    if [ -n "$project_dir" ]; then
+      if [ "$force" = true ]; then
+        git -C "$project_dir" worktree remove --force "$worktree_path" 2>/dev/null || true
+      else
+        git -C "$project_dir" worktree remove "$worktree_path" 2>/dev/null || true
+      fi
     fi
   fi
-  [ -n "$project_dir" ] && git -C "$project_dir" worktree prune 2>/dev/null || true
+  if [ -n "$project_dir" ]; then
+    git -C "$project_dir" worktree prune 2>/dev/null || true
+  fi
 
   # Delete branch if merged
   if [ -n "$name" ] && [ -n "$project_dir" ]; then
@@ -451,7 +556,7 @@ List dev-worktree environments.
 
 Options:
   --project-dir DIR   Filter by project
-  --json              Output JSON
+  --json              Output JSON (requires jq)
 EOF
         return 0 ;;
       *) echo "Unknown option: $1" >&2; return 1 ;;
@@ -478,25 +583,26 @@ EOF
   fi
 
   if [ "$json_output" = true ]; then
-    local json="[]"
-    while IFS=$'\t' read -r key wt_path state cname; do
-      [ -z "$key" ] && continue
-      json=$(echo "$json" | jq \
-        --arg k "$key" --arg p "$wt_path" --arg s "$state" --arg c "$cname" \
-        '. + [{"key": $k, "path": $p, "state": $s, "container": $c}]')
-    done <<< "$containers"
-    echo "$json" | jq .
+    if ! command -v jq &>/dev/null; then
+      echo "ERROR: jq is required for --json output. Install: brew install jq" >&2
+      return 1
+    fi
+    # Build JSON in a single jq invocation for efficiency
+    echo "$containers" | jq -R -s '
+      [split("\n")[] | select(length > 0) | split("\t") |
+       {key: .[0], path: .[1], state: .[2], container: .[3]}]'
     return 0
   fi
 
   printf "%-25s %-10s %-35s %s\n" "NAME" "STATUS" "PORTS" "PATH"
   printf "%-25s %-10s %-35s %s\n" "----" "------" "-----" "----"
 
-  local seen_keys=""
+  local -A seen_keys=()
+  local key="" wt_path="" state="" cname=""
   while IFS=$'\t' read -r key wt_path state cname; do
     [ -z "$key" ] && continue
-    echo "$seen_keys" | grep -qFx "$key" && continue
-    seen_keys=$(printf '%s\n%s' "$seen_keys" "$key")
+    [[ -n "${seen_keys[$key]+x}" ]] && continue
+    seen_keys[$key]=1
 
     local status="stopped"
     echo "$containers" | grep "^${key}"$'\t' | grep -q "running" && status="running"
@@ -510,13 +616,16 @@ EOF
 
 # ─── dev open ─────────────────────────────────────────────────
 
+# Internal: tmux dashboard watcher. Called via `dev _watcher` from tmux.
+# Not intended for direct user invocation.
 _watcher() {
   trap 'exit 0' SIGTERM SIGINT
   local session="$1" filter="${2:-}"
+  local poll_interval="${DEV_POLL_INTERVAL:-3}"
 
   while true; do
     tput clear 2>/dev/null || clear
-    echo "dev-worktree dashboard  (poll: 3s)"
+    echo "dev-worktree dashboard  (poll: ${poll_interval}s)"
     echo ""
 
     local containers
@@ -529,11 +638,12 @@ _watcher() {
       printf "  %-25s %-10s %s\n" "NAME" "STATUS" "PORTS"
       printf "  %-25s %-10s %s\n" "----" "------" "-----"
 
-      local seen_keys=""
+      local -A seen_keys=()
+      local key="" wt_path="" state=""
       while IFS=$'\t' read -r key wt_path state; do
         [ -z "$key" ] && continue
-        echo "$seen_keys" | grep -qFx "$key" && continue
-        seen_keys=$(printf '%s\n%s' "$seen_keys" "$key")
+        [[ -n "${seen_keys[$key]+x}" ]] && continue
+        seen_keys[$key]=1
 
         local status="stopped"
         echo "$containers" | grep "^${key}"$'\t' | grep -q "running" && status="running"
@@ -562,13 +672,15 @@ _watcher() {
       local exec_cmd
       exec_cmd=$(_get_exec_cmd "$wt_path")
 
+      # exec_cmd is intentionally unquoted for word-splitting (e.g., "claude --dangerously-skip-permissions").
+      # Safety: _validate_exec_cmd allowlist prevents glob/injection chars.
       tmux split-window -t "$session" -e "DEV_KEY=$key" -e "DEV_WT_PATH=$wt_path" -e "DEV_EXEC_CMD=$exec_cmd" \
         'printf "\033]2;${DEV_KEY}\033\\"; devcontainer exec --workspace-folder "${DEV_WT_PATH}" ${DEV_EXEC_CMD}; echo "--- Session ended (${DEV_KEY}). Press Enter to close. ---"; read'
       tmux select-pane -T "$key"
       tmux select-layout -t "$session" tiled
     done <<< "$containers"
 
-    sleep 3
+    sleep "$poll_interval"
   done
 }
 
@@ -590,6 +702,9 @@ The command is determined by WT_EXEC_CMD in .devcontainer/.env
 (default: claude --dangerously-skip-permissions).
 
 Requires 'tmux' for dashboard mode.
+
+Environment variables:
+  DEV_POLL_INTERVAL   Dashboard poll interval in seconds (default: 3)
 EOF
         return 0 ;;
       -*) echo "Unknown option: $1" >&2; return 1 ;;
@@ -631,6 +746,8 @@ EOF
     local exec_cmd
     exec_cmd=$(_get_exec_cmd "$worktree_dir")
 
+    # exec_cmd is intentionally unquoted for word-splitting (e.g., "claude --dangerously-skip-permissions").
+    # Safety: _validate_exec_cmd allowlist prevents glob/injection chars.
     devcontainer exec --workspace-folder "$worktree_dir" $exec_cmd
     return
   fi
@@ -783,8 +900,26 @@ Commands:
   list               Show environments
 
 Run 'dev <command> --help' for details.
+
+Environment variables:
+  DEV_DEBUG=1           Enable debug trace output
+  DEV_POLL_INTERVAL=N   Dashboard poll interval in seconds (default: 3)
 EOF
 }
+
+# Dependency check (skip for help/version which don't need docker)
+case "${1:-}" in
+  -h|--help|""|--version|-v) ;;
+  *)
+    for _dep in docker git; do
+      if ! command -v "$_dep" &>/dev/null; then
+        echo "ERROR: '$_dep' is required but not found." >&2
+        exit 1
+      fi
+    done
+    unset _dep
+    ;;
+esac
 
 case "${1:-}" in
   init)     shift; cmd_init "$@" ;;
