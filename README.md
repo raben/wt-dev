@@ -107,7 +107,7 @@ dev prune feature-auth
 | コマンド | 説明 |
 |---------|------|
 | `dev init` | `.devcontainer/` を対話的に生成 |
-| `dev up [name] [base]` | worktree 作成 → コンテナ起動 |
+| `dev up [name] [base]` | worktree 作成 → コンテナ起動（base デフォルト: `main`） |
 | `dev open [name]` | AI セッションを開く（tmux ダッシュボード） |
 | `dev down [name]` | コンテナ停止（worktree は保持） |
 | `dev prune [name]` | コンテナ・worktree・ブランチを完全削除 |

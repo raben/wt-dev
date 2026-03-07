@@ -21,7 +21,7 @@ dev-worktree のリリースフロー。VERSION bump → tag → push → Homebr
 
 ### Step 3: VERSION 更新 & コミット
 1. `bin/dev` の `VERSION="..."` を新バージョンに更新
-2. `git add bin/dev` + 未コミットの変更があれば一緒にステージ
+2. `git add bin/dev` のみステージ（無関係な変更を巻き込まない）
 3. コミット（メッセージ例: `chore: bump VERSION to X.Y.Z`）
 
 ### Step 4: タグ & プッシュ
@@ -51,3 +51,10 @@ dev-worktree のリリースフロー。VERSION bump → tag → push → Homebr
 - CWD が `/tmp/homebrew-dev-worktree` にリセットされることがある。コマンドは絶対パスか `cd` で対応
 - タグの force-update は避ける（SHA 不一致の原因になる）
 - VERSION の更新忘れに注意（過去に何度もハマった）
+- Step 5 で SHA256 取得に失敗した場合、GitHub 側のアーカイブ生成ラグの可能性がある。数秒待ってリトライ
+
+## ロールバック手順
+タグ push 後に問題が発覚した場合：
+1. タグ削除: `git tag -d vX.Y.Z && git push origin :refs/tags/vX.Y.Z`
+2. VERSION コミットを revert: `git revert HEAD`
+3. Homebrew tap が更新済みなら、tap リポも revert + push

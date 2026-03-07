@@ -54,12 +54,12 @@ _select_environment() {
   fi
 
   # Deduplicate keys
-  local -A seen_map=()
+  local _seen=""
   local keys=()
   while IFS=$'\t' read -r key state; do
     [ -z "$key" ] && continue
-    [[ -n "${seen_map[$key]+x}" ]] && continue
-    seen_map[$key]=1
+    echo "$_seen" | grep -qxF "$key" && continue
+    _seen="${_seen}${key}"$'\n'
     keys+=("$key ($state)")
   done <<< "$containers"
 
@@ -257,12 +257,22 @@ EOF
 
   # ── Protected branches: auto-generate a feature branch ──
   local protected_branches="main master develop"
-  if [[ " $protected_branches " == *" $name "* ]] && [ ! -d "$worktree_dir" ]; then
-    base_branch="$name"
-    name="dev-${name}"
-    worktree_dir="$(dirname "$project_dir")/${project_name}-${name}"
-    dev_key="${project_name}/${name}"
-    echo "Protected branch '$base_branch'. Creating '$name' from '$base_branch'."
+  if [[ " $protected_branches " == *" $name "* ]]; then
+    local dev_name="dev-${name}"
+    local dev_worktree_dir="$(dirname "$project_dir")/${project_name}-${dev_name}"
+    if [ -d "$dev_worktree_dir" ]; then
+      # Existing dev-<branch>: resume directly
+      name="$dev_name"
+      worktree_dir="$dev_worktree_dir"
+      dev_key="${project_name}/${name}"
+    elif [ ! -d "$worktree_dir" ]; then
+      # New: create dev-<branch> from protected branch
+      base_branch="$name"
+      name="$dev_name"
+      worktree_dir="$dev_worktree_dir"
+      dev_key="${project_name}/${name}"
+      echo "Protected branch '$base_branch'. Creating '$name' from '$base_branch'."
+    fi
   fi
 
   # ── Existing worktree: resume ──
@@ -326,7 +336,7 @@ EOF
   }
   trap cleanup EXIT
 
-  [ ! -d "$project_dir/.devcontainer" ] && { echo "ERROR: No .devcontainer/ in $project_dir"; return 1; }
+  [ ! -d "$project_dir/.devcontainer" ] && { echo "ERROR: No .devcontainer/ in $project_dir" >&2; return 1; }
 
   # Allocate ports
   local env_example="$project_dir/.devcontainer/.env.example"
@@ -589,7 +599,9 @@ EOF
   if [ -n "$project_dir" ]; then
     local pn
     pn=$(basename "$project_dir")
-    containers=$(echo "$containers" | { grep "^${pn}/" || true; })
+    local escaped_pn
+    escaped_pn=$(printf '%s' "$pn" | sed 's/[.[\*^$()+?{|\\]/\\&/g')
+    containers=$(echo "$containers" | { grep "^${escaped_pn}/" || true; })
     if [ -z "$containers" ]; then
       echo "No dev-worktree environments found for $pn."
       return 0
@@ -611,12 +623,12 @@ EOF
   printf "%-25s %-10s %-35s %s\n" "NAME" "STATUS" "PORTS" "PATH"
   printf "%-25s %-10s %-35s %s\n" "----" "------" "-----" "----"
 
-  local -A seen_keys=()
+  local _seen=""
   local key="" wt_path="" state="" cname=""
   while IFS=$'\t' read -r key wt_path state cname; do
     [ -z "$key" ] && continue
-    [[ -n "${seen_keys[$key]+x}" ]] && continue
-    seen_keys[$key]=1
+    echo "$_seen" | grep -qxF "$key" && continue
+    _seen="${_seen}${key}"$'\n'
 
     local status="stopped"
     echo "$containers" | grep "^${key}"$'\t' | grep -q "running" && status="running"
@@ -652,12 +664,12 @@ _watcher() {
       printf "  %-25s %-10s %s\n" "NAME" "STATUS" "PORTS"
       printf "  %-25s %-10s %s\n" "----" "------" "-----"
 
-      local -A seen_keys=()
+      local _seen=""
       local key="" wt_path="" state=""
       while IFS=$'\t' read -r key wt_path state; do
         [ -z "$key" ] && continue
-        [[ -n "${seen_keys[$key]+x}" ]] && continue
-        seen_keys[$key]=1
+        echo "$_seen" | grep -qxF "$key" && continue
+        _seen="${_seen}${key}"$'\n'
 
         local status="stopped"
         echo "$containers" | grep "^${key}"$'\t' | grep -q "running" && status="running"
