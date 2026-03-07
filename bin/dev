@@ -21,6 +21,27 @@ _trim() {
   printf '%s' "$s"
 }
 
+_spinner_start() {
+  local msg="${1:-Working}"
+  if [ -t 1 ]; then
+    printf '%s ' "$msg"
+    (while true; do printf '.'; sleep 1; done) &
+    _SPINNER_PID=$!
+  else
+    echo "$msg"
+    _SPINNER_PID=""
+  fi
+}
+
+_spinner_stop() {
+  if [ -n "${_SPINNER_PID:-}" ]; then
+    kill "$_SPINNER_PID" 2>/dev/null || true
+    wait "$_SPINNER_PID" 2>/dev/null || true
+    _SPINNER_PID=""
+    echo ""
+  fi
+}
+
 _validate_name() {
   local name="$1"
   if [[ ! "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9._/-]*$ ]]; then
@@ -299,11 +320,20 @@ EOF
     if _container_is_running "$dev_key"; then
       echo "Container already running."
     else
-      echo "Starting devcontainer..."
-      devcontainer up --workspace-folder "$worktree_dir" \
+      local _dc_log
+      _dc_log=$(mktemp /tmp/dev-worktree-dc-XXXXXX.log)
+      _spinner_start "Starting devcontainer"
+      if devcontainer up --workspace-folder "$worktree_dir" \
         --id-label "dev-worktree=$dev_key" \
         --id-label "dev-worktree.path=$worktree_dir" \
-        --id-label "dev-worktree.version=$VERSION"
+        --id-label "dev-worktree.version=$VERSION" \
+        > "$_dc_log" 2>&1; then
+        _spinner_stop
+        rm -f "$_dc_log"
+      else
+        _spinner_stop
+        echo "ERROR: devcontainer up failed. See log: $_dc_log" >&2
+      fi
     fi
 
     echo ""
@@ -410,25 +440,30 @@ EOF
   fi
 
   # Start devcontainer
-  echo "Starting devcontainer..."
   local _dc_exit=0
+  local _dc_log
+  _dc_log=$(mktemp /tmp/dev-worktree-dc-XXXXXX.log)
+  _spinner_start "Starting devcontainer"
   devcontainer up --workspace-folder "$worktree_dir" \
     --id-label "dev-worktree=$dev_key" \
     --id-label "dev-worktree.path=$worktree_dir" \
     --id-label "dev-worktree.version=$VERSION" \
+    > "$_dc_log" 2>&1 \
     || _dc_exit=$?
+  _spinner_stop
 
   if [ "$_dc_exit" -ne 0 ]; then
+    echo "ERROR: devcontainer up failed. See log: $_dc_log" >&2
     # Check if container is running despite devcontainer up failure (e.g. postCreateCommand failed)
     if _container_is_running "$dev_key"; then
-      echo ""
-      echo "WARNING: devcontainer up exited with errors, but the container is running." >&2
-      echo "  This usually means postCreateCommand failed (e.g. npm ci)." >&2
+      echo "WARNING: Container is running despite errors (postCreateCommand may have failed)." >&2
       echo "  You can connect with 'dev open' and fix manually." >&2
     else
       # Container not running — let cleanup handle it
       return "$_dc_exit"
     fi
+  else
+    rm -f "$_dc_log"
   fi
 
   # Disable cleanup — worktree created successfully
