@@ -4,7 +4,7 @@ set -euo pipefail
 # dev - Isolated parallel development environments
 # Usage: dev <command> [options]
 
-VERSION="0.9.3"
+VERSION="0.9.4"
 
 # ─── Debug mode ─────────────────────────────────────────────
 # Set DEV_DEBUG=1 to enable trace output for troubleshooting.
@@ -687,7 +687,7 @@ _watcher() {
       # exec_cmd is intentionally unquoted for word-splitting (e.g., "claude --dangerously-skip-permissions").
       # Safety: _validate_exec_cmd allowlist prevents glob/injection chars.
       tmux split-window -t "$session" -e "DEV_KEY=$key" -e "DEV_WT_PATH=$wt_path" -e "DEV_EXEC_CMD=$exec_cmd" \
-        'printf "\033]2;${DEV_KEY}\033\\"; devcontainer exec --workspace-folder "${DEV_WT_PATH}" ${DEV_EXEC_CMD}; echo "--- Session ended (${DEV_KEY}). Press Enter to close. ---"; read'
+        'printf "\033]2;${DEV_KEY}\033\\"; devcontainer exec --workspace-folder "${DEV_WT_PATH}" --id-label "dev-worktree=${DEV_KEY}" ${DEV_EXEC_CMD}; echo "--- Session ended (${DEV_KEY}). Press Enter to close. ---"; read'
       tmux select-pane -T "$key"
       tmux select-layout -t "$session" tiled
     done <<< "$containers"
@@ -760,7 +760,9 @@ EOF
 
     # exec_cmd is intentionally unquoted for word-splitting (e.g., "claude --dangerously-skip-permissions").
     # Safety: _validate_exec_cmd allowlist prevents glob/injection chars.
-    devcontainer exec --workspace-folder "$worktree_dir" $exec_cmd
+    # --id-label is required because devcontainer up uses custom labels (replaces default identification).
+    devcontainer exec --workspace-folder "$worktree_dir" \
+      --id-label "dev-worktree=$dev_key" $exec_cmd
     return
   fi
 
