@@ -172,10 +172,11 @@ v0.9.4 で発生したバグの再発防止。`--id-label` が正しく渡され
    - exit code が 0
    - コンテナが削除されている（`docker ps -a --filter "label=dev-worktree=dev-worktree-test/test-existing" -q` が空）
    - ワークツリーディレクトリ `/tmp/dev-worktree-test-test-existing` が存在しない
+   - ブランチが削除されている（`git -C /tmp/dev-worktree-test branch --list 'dev/dev-worktree-test/test-existing'` が空）
 3. test-new-branch を prune: `cd /tmp/dev-worktree-test && dev prune test-new-branch --force`
-4. 検証: 同上（ディレクトリは `/tmp/dev-worktree-test-test-new-branch`）
+4. 検証: 同上（ディレクトリは `/tmp/dev-worktree-test-test-new-branch`、ブランチは `dev/dev-worktree-test/test-new-branch`）
 5. dev-main を prune: `cd /tmp/dev-worktree-test && dev prune dev-main --force`
-6. 検証: 同上（ディレクトリは `/tmp/dev-worktree-test-dev-main`）
+6. 検証: 同上（ディレクトリは `/tmp/dev-worktree-test-dev-main`、ブランチは `dev/dev-worktree-test/dev-main`）
 
 ## クリーンアップ
 
