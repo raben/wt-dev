@@ -329,9 +329,7 @@ EOF
       # Clean up temp files
       rm -f "${worktree_dir}/.devcontainer/docker-compose.yml.tmp" 2>/dev/null || true
       rm -f "${worktree_dir}/.devcontainer/devcontainer.json.tmp" 2>/dev/null || true
-      echo "If cleanup was incomplete, try manually:" >&2
-      echo "  docker rm -f \$(docker ps -a --filter 'label=dev-worktree=$dev_key' -q)" >&2
-      echo "  git worktree remove --force '$worktree_dir'" >&2
+      echo "If cleanup was incomplete, run: dev prune $name --force" >&2
     fi
   }
   trap cleanup EXIT
