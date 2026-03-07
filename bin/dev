@@ -411,10 +411,25 @@ EOF
 
   # Start devcontainer
   echo "Starting devcontainer..."
+  local _dc_exit=0
   devcontainer up --workspace-folder "$worktree_dir" \
     --id-label "dev-worktree=$dev_key" \
     --id-label "dev-worktree.path=$worktree_dir" \
-    --id-label "dev-worktree.version=$VERSION"
+    --id-label "dev-worktree.version=$VERSION" \
+    || _dc_exit=$?
+
+  if [ "$_dc_exit" -ne 0 ]; then
+    # Check if container is running despite devcontainer up failure (e.g. postCreateCommand failed)
+    if _container_is_running "$dev_key"; then
+      echo ""
+      echo "WARNING: devcontainer up exited with errors, but the container is running." >&2
+      echo "  This usually means postCreateCommand failed (e.g. npm ci)." >&2
+      echo "  You can connect with 'dev open' and fix manually." >&2
+    else
+      # Container not running — let cleanup handle it
+      return "$_dc_exit"
+    fi
+  fi
 
   # Disable cleanup — worktree created successfully
   _cleanup_enabled=false
@@ -867,8 +882,8 @@ After user confirmation, generate:
 - `"service"`: "app"
 - `"workspaceFolder"`: "/workspace"
 - `"remoteUser"`: appropriate non-root user
-- `"mounts"`: bind mount `~/.gitconfig` (readonly). If $DEV_EXEC_CMD contains "claude", also mount `~/.claude` (for auth)
-- `"containerEnv"`: if $DEV_EXEC_CMD contains "claude", set `CLAUDE_CONFIG_DIR` to the mounted .claude path
+- `"mounts"`: bind mount `~/.gitconfig` (readonly). If $DEV_EXEC_CMD contains "claude", also add a Docker volume for Claude config: `source=claude-code-config,target=/home/<user>/.claude,type=volume` (this persists auth across container recreations; user runs `claude login` once inside the container)
+- `"containerEnv"`: if $DEV_EXEC_CMD contains "claude", set `CLAUDE_CONFIG_DIR` to `/home/<user>/.claude`
 - `"postCreateCommand"`: appropriate install command (npm ci, pnpm install, pip install, etc.)
 
 ### docker-compose.yml
