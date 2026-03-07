@@ -78,8 +78,8 @@ dev up feature-billing
 dev up feature-auth
 
 # main/master/develop を指定すると、自動でブランチを作成（2回目以降は再利用）
-dev up main          # → wt-main ブランチを main から作成
-dev up develop       # → wt-develop ブランチを develop から作成
+dev up main          # → dev-main ブランチを main から作成
+dev up develop       # → dev-develop ブランチを develop から作成
 ```
 
 ### 3. AI セッションを開く

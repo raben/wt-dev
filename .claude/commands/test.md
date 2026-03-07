@@ -74,8 +74,7 @@ main を指定すると自動でブランチが作成されることを検証。
 2. 検証:
    - exit code が 0
    - 出力に "Protected branch 'main'" が含まれる
-   - `wt-` で始まるブランチ名のコンテナが起動している
-3. 出力からブランチ名を取得して記録（後続のクリーンアップで使用）
+   - `dev-main` ブランチのコンテナが起動している（`docker ps --filter "label=dev-worktree=dev-worktree-test/dev-main" --filter "status=running" -q` が非空）
 
 ## テスト 4: dev list
 
@@ -115,7 +114,7 @@ v0.9.4 で発生したバグの再発防止。`--id-label` が正しく渡され
    - ワークツリーディレクトリが存在しない
 3. 次に test-new-branch を prune: `cd /tmp/dev-worktree-test && dev prune test-new-branch --force`
 4. 検証: 同上
-5. テスト 3 で作成された wt-* ブランチも prune: `cd /tmp/dev-worktree-test && dev prune <wt-name> --force`
+5. テスト 3 で作成された dev-main を prune: `cd /tmp/dev-worktree-test && dev prune dev-main --force`
 6. 検証: 同上
 
 ## クリーンアップ
